@@ -9,6 +9,8 @@ import { mockGarmin } from "./helpers";
 
 const BASE = "https://garmin-mcp.example.com";
 const REDIRECT = "https://client.example.com/callback";
+let lastClientId = "";
+let lastRefreshToken = "";
 
 /**
  * An execution context as Cloudflare passes it once Access has signed the
@@ -45,6 +47,7 @@ async function authorize(): Promise<string | Response> {
       body: JSON.stringify({ client_name: "Test client", redirect_uris: [REDIRECT], token_endpoint_auth_method: "none" }),
     })
   ).json<{ client_id: string }>();
+  lastClientId = client.client_id;
 
   const verifier = b64url(crypto.getRandomValues(new Uint8Array(32)));
   const challenge = b64url(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier)));
@@ -86,7 +89,8 @@ async function authorize(): Promise<string | Response> {
         resource: `${BASE}/mcp`,
       }),
     })
-  ).json<{ access_token: string }>();
+  ).json<{ access_token: string; refresh_token?: string }>();
+  lastRefreshToken = token.refresh_token ?? "";
   return token.access_token;
 }
 
@@ -119,6 +123,13 @@ describe("OAuth", () => {
     expect(response.headers.get("www-authenticate")).toContain("resource_metadata=");
   });
 
+  it("rejects invalid bearer tokens and forged consent handles", async () => {
+    const badToken = await call("/mcp", { method: "POST", headers: { authorization: "Bearer invalid-token" }, body: "{}" });
+    expect(badToken.status).toBe(401);
+    const forged = await call("/authorize", { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ handle: "fake", decision: "approve" }) });
+    expect(forged.status).toBeGreaterThanOrEqual(400);
+  });
+
   it("serves the consent page only to requests that passed this Access application", async () => {
     const request = new Request(`${BASE}/authorize?client_id=x`);
     const withAccess = (aud: string) =>
@@ -148,6 +159,28 @@ describe("MCP server", () => {
     expect(tools.every((tool) => tool.name.startsWith("garmin_") && tool.annotations.readOnlyHint)).toBe(true);
   });
 
+  it("refreshes an authorized client and refuses refresh for another client", async () => {
+    const original = await authorize();
+    expect(typeof original).toBe("string");
+    expect(lastRefreshToken).not.toBe("");
+    const refresh = lastRefreshToken, client = lastClientId;
+    const post = (clientId: string) => call("/token", { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ grant_type: "refresh_token", refresh_token: refresh, client_id: clientId, resource: `${BASE}/mcp` }) });
+    expect((await post("wrong-client")).status).toBeGreaterThanOrEqual(400);
+    const response = await post(client);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ access_token: expect.any(String) });
+  });
+
+  it("revokes an authorized client's refresh grant", async () => {
+    const original = await authorize();
+    expect(typeof original).toBe("string");
+    const refresh = lastRefreshToken, client = lastClientId;
+    const revoke = await call("/token", { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ token: refresh, token_type_hint: "refresh_token", client_id: client }) });
+    expect(revoke.status).toBe(200);
+    const after = await call("/token", { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ grant_type: "refresh_token", refresh_token: refresh, client_id: client, resource: `${BASE}/mcp` }) });
+    expect(after.status).toBeGreaterThanOrEqual(400);
+  });
+
   it("requests VO2 max for the chosen dates and optional sport", async () => {
     garmin = mockGarmin(() => Response.json([{ calendarDate: "2026-11-01", vo2Max: 50 }]));
     const result = await callTool("garmin_get_vo2_max", { startDate: "2026-11-01", endDate: "2026-11-10", sport: "running" });
@@ -156,6 +189,22 @@ describe("MCP server", () => {
     expect(url.searchParams.get("sport")).toBe("running");
     expect(result.isError).not.toBe(true);
     expect(JSON.parse(result.content.at(-1)!.text)).toEqual([{ calendarDate: "2026-11-01", vo2Max: 50 }]);
+  });
+
+  it("splits long VO2 histories and aggregates by sport", async () => {
+    garmin = mockGarmin((url) => Response.json([{ generic: { calendarDate: url.pathname.split('/').at(-2), vo2MaxValue: 50, sport: "running" } }]));
+    const result = await callTool("garmin_get_vo2_max", { startDate: "2026-01-01", endDate: "2026-02-01", period: "month" });
+    expect(garmin.calls.filter(url => url.pathname.includes('/metrics/maxmet/'))).toHaveLength(2);
+    expect(JSON.parse(result.content.at(-1)!.text)).toEqual([expect.objectContaining({ month: "2026-01", sport: "running", measurements: 2, vo2Max: 50 })]);
+  });
+
+  it("marks grouped results partial when a later page fails", async () => {
+    garmin = mockGarmin((url) => Number(url.searchParams.get("start")) === 0
+      ? Response.json(Array.from({length: 100}, (_, i) => ({ activityId: i + 1, activityType: { typeKey: "running" }, startTimeLocal: "2026-01-01 08:00:00", distance: 1000, duration: 300 })))
+      : new Response(null, { status: 500 }));
+    const result = await callTool("garmin_search_activities", { groupBy: "month" });
+    expect(result.content[0]!.text).toContain("INCOMPLETE");
+    expect(JSON.parse(result.content.at(-1)!.text)[0]).toMatchObject({ count: 100 });
   });
 
   it("requests Garmin's activity types", async () => {
@@ -327,7 +376,7 @@ describe("activity files", () => {
     const archive = zipSync({ "123_ACTIVITY.fit": fitActivity() });
     garmin = mockGarmin(() => new Response(archive, { headers: { "content-type": "application/x-zip-compressed" } }));
 
-    const result = await callTool("garmin_get_activity_fit", { activityId: 123, includeRecords: true, maxRecords: 50 });
+    const result = await callTool("garmin_get_activity_fit", { activityId: 123, includeRecords: true, includeLocations: true, maxRecords: 50 });
     const decoded = JSON.parse(result.content.at(-1)!.text);
 
     expect(decoded.fileName).toBe("123_ACTIVITY.fit");
@@ -352,5 +401,14 @@ describe("activity files", () => {
     const result = await callTool("garmin_get_activity_fit", { activityId: 123 });
     expect(result.isError).toBe(true);
     expect(result.content[0]!.text).toMatch(/no FIT data/);
+  });
+
+  it("omits GPS by default and returns a selected time window", async () => {
+    garmin = mockGarmin(() => new Response(zipSync({ "test.fit": fitActivity() })));
+    const result = await callTool("garmin_get_activity_fit", { activityId: 123, includeRecords: true, startSeconds: 100, endSeconds: 110 });
+    const decoded = JSON.parse(result.content.at(-1)!.text);
+    expect(decoded.records.columns).not.toContain("lat");
+    expect(decoded.sampling).toMatchObject({ windowRecords: 11, startSeconds: 100, endSeconds: 110 });
+    expect(decoded.records.rows[0][0]).toBe(100);
   });
 });

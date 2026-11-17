@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { type ToolContext, READ_ONLY, dateRange, fetchInWindows, includeSamples, optionalDate, resolveRange } from "../context";
 import { error, jsonResult, safely } from "../result";
-import { aggregate, detail, period, summarizeDay } from "../summaries";
+import { aggregate, coverageNote, detail, period, summarizeDay } from "../summaries";
 
 const HEART_RATE_SAMPLES = ["heartRateValues", "heartRateValueDescriptors"];
 const SPO2_SAMPLES = [
@@ -97,7 +97,7 @@ export function registerDailyTools({ server, garmin, today }: ToolContext) {
           });
           return page?.data ?? [];
         });
-        return jsonResult(detail === "full" ? days : aggregate(days.map(summarizeDay), period));
+        return jsonResult(detail === "full" ? days : aggregate(days.map(summarizeDay), period), { note: coverageNote(days, range.start, range.end) });
       }),
   );
 

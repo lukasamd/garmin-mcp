@@ -52,6 +52,8 @@ On top of forwarding API calls, the server shapes the responses so a model reads
   - Sample arrays are left out unless requested (`includeSamples`), and each result is capped at about 100,000 characters.
 - **Fixed units:** Garmin sends weight and body composition in grams although its reference says kilograms; the server returns kilograms.
 - **Decoded FIT files:** `garmin_get_activity_fit` downloads the original ZIP and decodes it with Garmin's [official FIT SDK](https://github.com/garmin/fit-javascript-sdk). It returns sessions, laps, per-kilometre splits computed from every record, Garmin's own splits, time in zones and, on request, the timeline as a table.
+- **FIT detail and privacy:** select a timeline window with `startSeconds`/`endSeconds`. With `includeRecords`, bucket minima/maxima and abrupt HR changes use all records in that window, even if individual rows are sampled. `targetHeartRate` reports the first recorded crossing, not physiological response time. GPS coordinates are excluded unless `includeLocations` is true. Split times use timer events when available and otherwise include elapsed time, which may include pauses; interpolated values are approximate.
+- **Completeness:** grouped metrics report `samplesPerField`; missing measurements are not zero. Activity aggregation may return an explicit `INCOMPLETE` warning when limits or errors prevent a full result. VO₂ max ranges are split into 28-day requests and can be summarized by week or month and sport.
 - **Actionable errors:** Garmin failures (expired key, invalid range, 429…) reach the model as tool errors that say how to fix them.
 - **"Today" in your time zone:** set by `TIMEZONE`. The server instructions include today's date and weekday.
 
@@ -304,7 +306,7 @@ The client opens `/authorize` in your browser: sign in with the code Access emai
   pnpm wrangler tail garmin-mcp
   ```
 
-- **Disconnect every client:** clear the `garmin-mcp-oauth-kv` namespace from the dashboard. Clients will have to authorize again.
+- **Disconnect clients:** remove a client in its settings; to invalidate all grants, clear only this Worker's `garmin-mcp-oauth-kv` namespace. KV is eventually consistent, so changes may take time to propagate. Delete the Personal API key in Garmin to revoke that key and its Garmin tokens. Clients must authorize again after grants are removed.
 
 ## Security
 
@@ -313,7 +315,7 @@ The client opens `/authorize` in your browser: sign in with the code Access emai
   - It shows the application's name, whether it is verified and the host the token will be sent to, and warns when the destination is a local app.
   - The form carries a single-use handle bound to the browser and cannot be embedded in another site.
   - Only you reach it: Cloudflare Access signs you in with a one-time code to your email, and the Worker fails closed (403) unless the request carries this Access application's identity (`ctx.access`), so it can't be bypassed through another route.
-- **Secrets:** the Garmin key only lives in the Worker's secrets. MCP clients never see it, and it never appears in logs or responses.
+- **Secrets:** put the Garmin key in Worker secrets; MCP clients receive an OAuth token, not the Garmin key. Cached Garmin access tokens are stored in the account's KV namespace and must be protected accordingly. Avoid sharing raw logs or error messages.
 - **Read-only:** the server sends `GET` requests for Garmin data and uses `POST` only to exchange the Personal API key for an access token.
 - **Personal use:** the Personal API is for the key's owner. This server is meant for a single user and should not be shared with others.
 

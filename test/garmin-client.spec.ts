@@ -39,6 +39,28 @@ describe("GarminClient", () => {
     expect(calls[1]!.url.origin).toBe(GARMIN);
   });
 
+  it("shares token refresh between concurrent calls in one isolate", async () => {
+    const { client, calls } = clientWith((url) => isTokenRequest(url) ? new Response(fakeJwt()) : Response.json({ ok: true }));
+    await Promise.all([client.getJson("/a"), client.getJson("/b"), client.getJson("/c")]);
+    expect(calls.filter(({ url }) => isTokenRequest(url))).toHaveLength(1);
+  });
+
+  it("does not expose upstream error bodies or send a token to another origin", async () => {
+    const { client } = clientWith((url) => isTokenRequest(url) ? new Response(fakeJwt()) : new Response("sensitive-response", { status: 500 }));
+    await expect(client.getJson("/a")).rejects.not.toThrow(/sensitive-response/);
+    await expect(client.getJson("https://example.com/steal")).rejects.toThrow(/Invalid Garmin endpoint/);
+  });
+
+  it("constructs requests in Workers with manual redirects and does not follow them", async () => {
+    const { client, calls } = clientWith((url, init) => {
+      const request = new Request(url, init);
+      expect(request.redirect).toBe("manual");
+      return isTokenRequest(url) ? new Response(fakeJwt()) : Response.redirect("https://example.com/steal", 302);
+    });
+    await expect(client.getJson("/a")).rejects.toThrow(/HTTP 302/);
+    expect(calls.every(({ url }) => url.origin === GARMIN)).toBe(true);
+  });
+
   it("renews a revoked token once and retries", async () => {
     let dataCalls = 0;
     const { client, calls } = clientWith((url) => {

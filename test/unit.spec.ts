@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { addDays, dateWindows, daysBetween, isValidDate, today } from "../src/garmin/dates";
-import { downsample } from "../src/garmin/fit";
+import { distanceSplits, downsample, heartRateChanges, summarizeBuckets, targetHeartRate } from "../src/garmin/fit";
 import { MAX_RESULT_CHARS, jsonResult } from "../src/mcp/result";
 import { activityTotals, aggregate, sportOf, summarizeSleep } from "../src/mcp/summaries";
 
@@ -73,6 +73,23 @@ describe("downsample", () => {
   });
 });
 
+describe("FIT accuracy", () => {
+  const at = (s: number) => new Date(s * 1000);
+  it("keeps elapsed time across sparse records and uses timer events for a short pause", () => {
+    const records = [{ timestamp: at(0), distance: 0 }, { timestamp: at(31), distance: 100 }, { timestamp: at(62), distance: 200 }];
+    expect(distanceSplits(records, 1000)[0]).toMatchObject({ distanceMeters: 200, seconds: 62 });
+    const events = [{ event: "timer", eventType: "stop", timestamp: at(10) }, { event: "timer", eventType: "start", timestamp: at(20) }];
+    expect(distanceSplits(records, 1000, events)[0]).toMatchObject({ seconds: 52 });
+  });
+  it("preserves a brief HR spike in bucket extrema and reports the sample change", () => {
+    const records = Array.from({ length: 100 }, (_, i) => ({ timestamp: at(i), heartRate: i === 10 ? 190 : 140 }));
+    const buckets = summarizeBuckets(records, 2, 0) as Array<{ heartRate: { max: number } }>;
+    expect(buckets[0]!.heartRate.max).toBe(190);
+    expect(heartRateChanges(records, 0)).toHaveLength(2);
+    expect(targetHeartRate(records, 0, 0, 180)).toMatchObject({ firstReachedSeconds: 10 });
+  });
+});
+
 describe("summaries", () => {
   it("flattens a night of sleep", () => {
     const row = summarizeSleep({
@@ -93,9 +110,9 @@ describe("summaries", () => {
     ];
     expect(aggregate(rows, "week")).toEqual([
       { weekStarting: "2026-10-26", days: 1, restingHeartRate: 50 },
-      { weekStarting: "2026-11-02", days: 3, restingHeartRate: 53 },
+      { weekStarting: "2026-11-02", days: 3, restingHeartRate: 53, samplesPerField: { restingHeartRate: 2 } },
     ]);
-    expect(aggregate(rows, "month")).toEqual([{ month: "2026-11", days: 4, restingHeartRate: 52 }]);
+    expect(aggregate(rows, "month")).toEqual([{ month: "2026-11", days: 4, restingHeartRate: 52, samplesPerField: { restingHeartRate: 3 } }]);
   });
 });
 

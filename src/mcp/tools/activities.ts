@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { decodeFit, unzipActivity } from "../../garmin/fit";
+import { dateWindows, daysBetween } from "../../garmin/dates";
 import { type ToolContext, READ_ONLY, date, dateRange, fetchInWindows, resolveRange } from "../context";
 import { error, jsonResult, safely } from "../result";
 import { activityTotals } from "../summaries";
@@ -27,7 +28,7 @@ const ACTIVITY_NOISE = [
 
 type Activity = Record<string, unknown>;
 
-const typeKey = (value: unknown) => (value as { typeKey?: string } | undefined)?.typeKey;
+const typeKey = (value: unknown) => typeof value === "string" ? value : (value as { typeKey?: string } | undefined)?.typeKey;
 
 /** The fields that answer most questions about a list of activities (~0.5 KB instead of ~3 KB each). */
 function summarizeActivity(activity: Activity): Activity {
@@ -147,12 +148,13 @@ export function registerActivityTools({ server, garmin, today }: ToolContext) {
     },
     (input) =>
       safely(async () => {
-        const search = (start: number, limit: number) =>
+        if (input.startDate && input.endDate && input.startDate > input.endDate) return error("startDate must not be after endDate.");
+        const search = (start: number, limit: number, from = input.startDate, to = input.endDate) =>
           garmin.getJson<Activity[]>("/activitylist-service/activities/search/activities", {
             start,
             limit,
-            startDate: input.startDate,
-            endDate: input.endDate,
+            startDate: from,
+            endDate: to,
             activityType: input.activityType,
             activitySubType: input.activitySubType,
             excludedActivitySubType: input.excludedActivitySubTypes,
@@ -185,18 +187,39 @@ export function registerActivityTools({ server, garmin, today }: ToolContext) {
 
         if (input.groupBy) {
           const all: Activity[] = [];
-          for (let start = 0; start < MAX_GROUPED_ACTIVITIES; start += PAGE_SIZE) {
-            const page = (await search(start, PAGE_SIZE)) ?? [];
-            all.push(...page);
-            if (page.length < PAGE_SIZE) break;
+          if (input.startDate && input.endDate && (input.startDate > input.endDate || daysBetween(input.startDate, input.endDate) > 366)) return error("Grouped activity ranges must be ordered and at most 366 days.");
+          const windows = input.startDate && input.endDate ? dateWindows(input.startDate, input.endDate, 90) : [[input.startDate, input.endDate]];
+          const seen = new Set<string>();
+          let requests = 0;
+          let partial = false;
+          outer: for (const [from, to] of windows) {
+            for (let start = 0; ; start += PAGE_SIZE) {
+              // Two outbound attempts per page plus auth/KV must fit Workers Free's subrequest limit.
+              if (++requests > 20 || all.length >= MAX_GROUPED_ACTIVITIES) { partial = true; break outer; }
+              let page: Activity[];
+              try { page = (await search(start, PAGE_SIZE, from, to)) ?? []; }
+              catch { partial = true; break outer; }
+              let added = 0;
+              for (const activity of page) {
+                const id = activity.activityId;
+                if (id !== undefined && id !== null) {
+                  const key = String(id);
+                  if (seen.has(key)) continue;
+                  seen.add(key);
+                }
+                if (all.length >= MAX_GROUPED_ACTIVITIES) { partial = true; break outer; }
+                all.push(activity); added++;
+              }
+              if (page.length < PAGE_SIZE) break;
+              if (added === 0) { partial = true; break outer; }
+            }
           }
           const totals = activityTotals(all.map(summarizeActivity), input.groupBy);
           const grand = activityTotals(all.map(summarizeActivity), "total").find((row) => row.sport === "all");
-          const capped = all.length >= MAX_GROUPED_ACTIVITIES;
           const note =
-            `${all.length} activities in total: ${grand?.distanceKm ?? 0} km, ${grand?.durationHours ?? 0} h.` +
+            `${all.length} activities in total: ${grand?.distanceKm ?? "unknown"} km, ${grand?.durationHours ?? "unknown"} h.` +
             " Periods without activities are not listed." +
-            (capped ? ` Capped at ${MAX_GROUPED_ACTIVITIES} activities: narrow the date range for complete totals.` : "");
+            (partial ? " INCOMPLETE: a request failed, repeated records or a safety limit was reached; narrow the range and retry. Totals are partial." : "");
           return jsonResult(totals, { note });
         }
 
@@ -242,10 +265,14 @@ export function registerActivityTools({ server, garmin, today }: ToolContext) {
     {
       title: "Decode activity file",
       description:
-        "Download an activity's original FIT file and decode it: sessions, laps, distanceSplits (per-km splits with pace, average HR and ascent, computed from every record; time while the watch was paused is excluded, walk breaks are not; the last split may be shorter), Garmin's own splits (run/walk, intervals), time in zones (seconds per zone, from zone 0 below zone 1; hrZoneHighBoundary gives the bpm limits used), devices and events. Coordinates are in degrees. FIT cadence is per leg: double it for running steps per minute. Set includeRecords for the timeline as a table (elapsedSeconds, distance m, speed m/s, heartRate, cadence, power, altitude m, lat/lon, temperature), evenly downsampled to maxRecords rows.",
+        "Decode the original FIT: sessions, laps and distance splits. Timer events are used for pauses when available; otherwise split times are elapsed-time approximations. includeRecords returns sampled rows, full-window bucket extrema and rapid HR changes. Use startSeconds/endSeconds for detailed intervals. GPS coordinates are excluded unless includeLocations is true. FIT running cadence is per leg.",
       inputSchema: z.object({
         activityId,
         includeRecords: z.boolean().default(false).describe("Include the record timeline as a table."),
+        startSeconds: z.number().nonnegative().optional().describe("Start of requested timeline window in elapsed seconds from the first record."),
+        endSeconds: z.number().nonnegative().optional().describe("End of requested timeline window in elapsed seconds from the first record."),
+        includeLocations: z.boolean().default(false).describe("Include GPS coordinates; off by default for privacy."),
+        targetHeartRate: z.number().int().min(30).max(250).optional().describe("With includeRecords, report the first recorded HR at or above this target in the selected window."),
         maxRecords: z
           .number()
           .int()
@@ -263,15 +290,16 @@ export function registerActivityTools({ server, garmin, today }: ToolContext) {
       }),
       annotations: { title: "Decode activity file", ...READ_ONLY },
     },
-    ({ activityId, includeRecords, maxRecords, splitDistanceMeters }) =>
+    ({ activityId, includeRecords, maxRecords, splitDistanceMeters, startSeconds, endSeconds, includeLocations, targetHeartRate }) =>
       safely(async () => {
+        if (startSeconds !== undefined && endSeconds !== undefined && startSeconds > endSeconds) return error("startSeconds must not be after endSeconds.");
         const archive = await garmin.getBytes(`/download-service/files/activity/${activityId}`);
         const files = unzipActivity(archive).filter(({ name }) => /\.fit$/i.test(name));
         if (files.length === 0) {
           return error("The activity file has no FIT data (it may have been imported as GPX or TCX).");
         }
         const decoded = files.map(({ name, data }) =>
-          decodeFit(name, data, { includeRecords, maxRecords, splitDistance: splitDistanceMeters }),
+          decodeFit(name, data, { includeRecords, maxRecords, splitDistance: splitDistanceMeters, startSeconds, endSeconds, includeLocations, targetHeartRate }),
         );
         return jsonResult(decoded.length === 1 ? decoded[0] : decoded);
       }),

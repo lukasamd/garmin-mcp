@@ -46,6 +46,7 @@ interface CachedToken {
 }
 
 const memoryTokens = new Map<string, CachedToken>();
+const pendingTokens = new Map<string, Promise<CachedToken>>();
 
 export class GarminClient {
   readonly baseUrl: string;
@@ -77,11 +78,33 @@ export class GarminClient {
   /** GET a binary endpoint, such as an activity file download. */
   async getBytes(path: string, query?: Query): Promise<Uint8Array> {
     const response = await this.#get(path, query, "*/*");
-    return new Uint8Array(await response.arrayBuffer());
+    const limit = 12 * 1024 * 1024;
+    const declared = Number(response.headers.get("content-length"));
+    if (declared > limit) throw new GarminApiError("Activity download exceeds the 12 MiB safety limit.", 413);
+    if (!response.body) return new Uint8Array();
+    const reader = response.body.getReader();
+    const chunks: Uint8Array[] = [];
+    let size = 0;
+    try {
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        size += value.length;
+        if (size > limit) { await reader.cancel(); throw new GarminApiError("Activity download exceeds the 12 MiB safety limit.", 413); }
+        chunks.push(value);
+      }
+    } finally { reader.releaseLock(); }
+    const bytes = new Uint8Array(size);
+    let offset = 0;
+    for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.length; }
+    return bytes;
   }
 
   async #get(path: string, query: Query | undefined, accept: string): Promise<Response> {
     const url = new URL(path, this.baseUrl);
+    if (url.origin !== this.baseUrl || !path.startsWith("/") || path.startsWith("//")) {
+      throw new GarminApiError("Invalid Garmin endpoint.", 400);
+    }
     for (const [key, value] of Object.entries(query ?? {})) {
       if (value === undefined) continue;
       if (Array.isArray(value)) value.forEach((item) => url.searchParams.append(key, item));
@@ -101,10 +124,16 @@ export class GarminClient {
 
   async #send(url: URL, token: string, accept: string): Promise<Response> {
     try {
-      return await this.#fetch(url, {
-        headers: { Authorization: `Bearer ${token}`, Accept: accept },
-        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-      });
+      const request = () => this.#fetch(url, { headers: { Authorization: `Bearer ${token}`, Accept: accept }, redirect: "manual", signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
+      const response = await request();
+      if (response.status !== 429 && response.status !== 503) return response;
+      const header = response.headers.get("retry-after");
+      const delay = header && /^\d+$/.test(header) ? Number(header) * 1000 : header ? Infinity : 300;
+      // Do not sleep longer than two seconds; leave longer retry policies to the client.
+      if (delay > 2000) return response;
+      await response.body?.cancel();
+      await new Promise(resolve => setTimeout(resolve, delay));
+      return await request();
     } catch (error) {
       throw networkError(error);
     }
@@ -119,19 +148,30 @@ export class GarminClient {
     if (!forceRefresh) {
       const inMemory = memoryTokens.get(cacheKey);
       if (isFresh(inMemory)) return inMemory.accessToken;
-      const stored = await this.#kv.get<CachedToken>(cacheKey, "json");
+      const stored = await this.#kv.get<CachedToken>(cacheKey, "json").catch(() => null);
       if (isFresh(stored)) {
         memoryTokens.set(cacheKey, stored);
         return stored.accessToken;
       }
     }
 
-    const token = await this.#exchangeKey();
-    memoryTokens.set(cacheKey, token);
-    const ttl = Math.floor(token.expiresAt - TOKEN_EXPIRY_MARGIN_S - now);
-    // KV requires a TTL of at least 60 seconds.
-    if (ttl >= 60) await this.#kv.put(cacheKey, JSON.stringify(token), { expirationTtl: ttl });
-    return token.accessToken;
+    let pending = pendingTokens.get(cacheKey);
+    if (!pending) {
+      pending = (async () => {
+        const token = await this.#exchangeKey();
+        memoryTokens.set(cacheKey, token);
+        const ttl = Math.floor(token.expiresAt - TOKEN_EXPIRY_MARGIN_S - Date.now() / 1000);
+        if (ttl >= 60) {
+          // KV can reject simultaneous writes from different isolates. A valid
+          // in-memory token still allows this request to proceed.
+          try { await this.#kv.put(cacheKey, JSON.stringify(token), { expirationTtl: ttl }); } catch { /* cache is optional */ }
+        }
+        return token;
+      })();
+      pendingTokens.set(cacheKey, pending);
+      void pending.finally(() => { if (pendingTokens.get(cacheKey) === pending) pendingTokens.delete(cacheKey); }).catch(() => {});
+    }
+    return (await pending).accessToken;
   }
 
   async #exchangeKey(): Promise<CachedToken> {
@@ -141,6 +181,7 @@ export class GarminClient {
         method: "POST",
         // The endpoint answers with the raw token and rejects `Accept: application/json` (406).
         headers: { Authorization: `ApiKey ${this.#apiKey}`, Accept: "*/*" },
+        redirect: "manual",
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       });
     } catch (error) {
@@ -185,8 +226,6 @@ function jwtExpiry(token: string): number | undefined {
 }
 
 async function toApiError(response: Response, path: string): Promise<GarminApiError> {
-  const detail = (await response.text().catch(() => "")).slice(0, 300).trim();
-  const suffix = detail ? ` Garmin said: ${detail}` : "";
   const status = response.status;
   const messages: Record<number, string> = {
     400: "Garmin rejected the request parameters. Check the date format (YYYY-MM-DD), that the range is within the endpoint's limit, and that IDs and filter keys are valid.",
@@ -200,7 +239,7 @@ async function toApiError(response: Response, path: string): Promise<GarminApiEr
     (status >= 500
       ? `Garmin had a server error (HTTP ${status}). Retry later.`
       : `Garmin returned HTTP ${status} for ${path}.`);
-  return new GarminApiError(`${message}${suffix}`, status);
+  return new GarminApiError(message, status);
 }
 
 function networkError(error: unknown): GarminApiError {

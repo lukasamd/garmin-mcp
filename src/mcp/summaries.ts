@@ -3,9 +3,14 @@
  * full payload (~2.5 KB per day) would not fit a year into one tool result.
  */
 import { z } from "zod";
-import { addDays } from "../garmin/dates";
+import { addDays, daysBetween } from "../garmin/dates";
 
 type Row = Record<string, unknown>;
+
+export function coverageNote(rows: Row[], start: string, end: string): string {
+  const days = new Set(rows.map(row => row.calendarDate).filter((date): date is string => typeof date === "string" && date >= start && date <= end));
+  return `Requested ${start} through ${end} (${daysBetween(start, end)} days); ${days.size} distinct dates were returned. Missing dates and fields are not zero; averages only include available measurements.`;
+}
 
 export const detail = z
   .enum(["summary", "full"])
@@ -92,16 +97,19 @@ export function aggregate(
   return [...groups].map(([key, group]) => {
     const averaged: Row = { [by === "month" ? "month" : "weekStarting"]: key, [countKey]: group.length };
     const fields = new Set(group.flatMap((row) => Object.keys(row)));
+    const coverage: Record<string, number> = {};
     for (const field of fields) {
-      const values = group.map((row) => row[field]).filter((value): value is number => typeof value === "number");
+      const values = group.map((row) => row[field]).filter((value): value is number => typeof value === "number" && Number.isFinite(value));
       // An average of epoch timestamps (bedtimes, wake times) means nothing.
       if (values.length === 0 || values.some((value) => value >= 1e12)) continue;
       averaged[field] = Math.round((values.reduce((sum, value) => sum + value, 0) / values.length) * 100) / 100;
+      if (values.length < group.length) coverage[field] = values.length;
       if (extremes.includes(field)) {
         averaged[`${field}Min`] = Math.min(...values);
         averaged[`${field}Max`] = Math.max(...values);
       }
     }
+    if (Object.keys(coverage).length) averaged.samplesPerField = coverage;
     return averaged;
   });
 }
@@ -146,6 +154,7 @@ export function activityTotals(activities: Row[], by: TotalsPeriod): Row[] {
     load: number;
     hrSum: number;
     hrSeconds: number;
+    available: Record<string, number>;
   };
   const empty = (): Totals => ({
     types: new Set(),
@@ -158,12 +167,16 @@ export function activityTotals(activities: Row[], by: TotalsPeriod): Row[] {
     load: 0,
     hrSum: 0,
     hrSeconds: 0,
+    available: {},
   });
   const groups = new Map<string, Map<string, Totals>>();
   const add = (totals: Totals, activity: Row, type: string) => {
     const number = (key: string) => (typeof activity[key] === "number" ? (activity[key] as number) : 0);
     totals.types.add(type);
     totals.count += 1;
+    for (const key of ["distance", "duration", "movingDuration", "elevationGain", "calories", "activityTrainingLoad", "averageHR"]) {
+      if (typeof activity[key] === "number" && Number.isFinite(activity[key]) && (key !== "averageHR" || (activity[key] as number) > 0)) totals.available[key] = (totals.available[key] ?? 0) + 1;
+    }
     totals.meters += number("distance");
     totals.seconds += number("duration");
     totals.moving += number("movingDuration");
@@ -182,7 +195,7 @@ export function activityTotals(activities: Row[], by: TotalsPeriod): Row[] {
     const type = String(activity.activityType ?? "unknown");
     const sports = groups.get(period) ?? new Map<string, Totals>();
     groups.set(period, sports);
-    for (const key of [sportOf(type), "all"]) {
+    for (const key of new Set([sportOf(type), "all"])) {
       const totals = sports.get(key) ?? empty();
       sports.set(key, totals);
       add(totals, activity, type);
@@ -205,12 +218,13 @@ export function activityTotals(activities: Row[], by: TotalsPeriod): Row[] {
             activityTypes: [...totals.types].sort(),
           }),
           count: totals.count,
-          distanceKm: round(totals.meters / 1000, 2),
-          durationHours: round(totals.seconds / 3600, 2),
-          movingHours: round(totals.moving / 3600, 2),
-          elevationGainMeters: Math.round(totals.ascent),
-          calories: Math.round(totals.calories),
-          trainingLoad: Math.round(totals.load),
+          ...(totals.available.distance && { distanceKm: round(totals.meters / 1000, 2) }),
+          ...(totals.available.duration && { durationHours: round(totals.seconds / 3600, 2) }),
+          ...(totals.available.movingDuration && { movingHours: round(totals.moving / 3600, 2) }),
+          ...(totals.available.elevationGain && { elevationGainMeters: Math.round(totals.ascent) }),
+          ...(totals.available.calories && { calories: Math.round(totals.calories) }),
+          ...(totals.available.activityTrainingLoad && { trainingLoad: Math.round(totals.load) }),
+          samplesPerField: Object.fromEntries(["distance", "duration", "movingDuration", "elevationGain", "calories", "activityTrainingLoad", "averageHR"].map(key => [key, totals.available[key] ?? 0])),
           ...(totals.hrSeconds > 0 && { avgHeartRate: Math.round(totals.hrSum / totals.hrSeconds) }),
         })),
     );

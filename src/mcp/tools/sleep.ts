@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { type ToolContext, READ_ONLY, dateRange, fetchInWindows, optionalDate, resolveRange } from "../context";
 import { error, jsonResult, safely } from "../result";
-import { aggregate, detail, period, summarizeSleep } from "../summaries";
+import { aggregate, coverageNote, detail, period, summarizeSleep } from "../summaries";
 
 /** Sleep and heart rate variability. */
 export function registerSleepTools({ server, garmin, today }: ToolContext) {
@@ -38,7 +38,7 @@ export function registerSleepTools({ server, garmin, today }: ToolContext) {
             endDate: to,
           }),
         );
-        return jsonResult(detail === "full" ? nights : aggregate(nights.map(summarizeSleep), period));
+        return jsonResult(detail === "full" ? nights : aggregate(nights.map(summarizeSleep), period), { note: coverageNote(nights, range.start, range.end) });
       }),
   );
 
@@ -74,11 +74,11 @@ export function registerSleepTools({ server, garmin, today }: ToolContext) {
         const range = resolveRange(today, input, { defaultDays: 28 });
         if ("error" in range) return error(range.error);
         // The per-request limit is undocumented; 31 days matches Garmin's other range endpoints.
-        const summaries = await fetchInWindows(range.start, range.end, 31, async (from, to) => {
-          const page = await garmin.getJson<{ hrvSummaries?: unknown[] }>(`/hrv-service/hrv/daily/${from}/${to}`);
+        const summaries = await fetchInWindows<Record<string, unknown>>(range.start, range.end, 31, async (from, to) => {
+          const page = await garmin.getJson<{ hrvSummaries?: Array<Record<string, unknown>> }>(`/hrv-service/hrv/daily/${from}/${to}`);
           return page?.hrvSummaries ?? [];
         });
-        return jsonResult(summaries);
+        return jsonResult(summaries, { note: coverageNote(summaries, range.start, range.end) });
       }),
   );
 }

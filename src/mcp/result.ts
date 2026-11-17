@@ -57,7 +57,7 @@ export async function safely(run: () => Promise<CallToolResult>): Promise<CallTo
     return await run();
   } catch (cause) {
     if (cause instanceof GarminApiError) return error(cause.message);
-    console.error(JSON.stringify({ message: "tool failed", error: String(cause) }));
+    console.error(JSON.stringify({ message: "tool failed", category: "unexpected" }));
     return error("Unexpected error while talking to Garmin. Retry; if it keeps failing, check the Worker logs.");
   }
 }
