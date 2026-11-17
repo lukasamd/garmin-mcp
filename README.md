@@ -1,5 +1,7 @@
 # garmin-mcp
 
+> This repository is a fork of [barcia/garmin-mcp](https://github.com/barcia/garmin-mcp). It adds read-only VO₂ max and activity-type tools. Polish setup guide: [INSTRUKCJA.md](INSTRUKCJA.md).
+
 A remote MCP server that gives Claude (web, desktop, mobile and Claude Code), or any MCP client, read-only access to your Garmin Connect data. It uses Garmin's [official Personal API](https://developer.garmin.com/gc-developer-program/personal/personal-api): no Garmin password, no scraping. It runs on Cloudflare Workers with the [Agents SDK](https://developers.cloudflare.com/agents/) and is protected by OAuth 2.1.
 
 Everyone deploys it to their own Cloudflare account with their own Garmin key: it is a single-user server (see [Deployment](#deployment)).
@@ -55,7 +57,7 @@ On top of forwarding API calls, the server shapes the responses so a model reads
 
 ## Tools and prompts
 
-There is one tool per Personal API endpoint (26), with every documented parameter. All of them are read-only (`readOnlyHint`).
+The server exposes 28 read-only tools (`readOnlyHint`), including VO₂ max and activity types. Garmin may change the available endpoints and data.
 
 | Tool | Returns | Garmin endpoint |
 |---|---|---|
@@ -79,11 +81,13 @@ There is one tool per Personal API endpoint (26), with every documented paramete
 | `garmin_get_activity_workouts` | Structured workout performed during the activity | `activity-service/activity/{id}/workouts` |
 | `garmin_get_activity_fit` | The decoded FIT file: sessions, laps, per-km splits, zones and timeline | `download-service/files/activity/{id}` |
 | `garmin_get_wellness_activities` | Wellness activities in a range | `wellnessactivity-service/activity/summary/range` |
+| `garmin_get_activity_types` | Activity types and identifiers | `activity-service/activity/activityTypes/simple` |
 | **Body** | | |
 | `garmin_get_weight` | Weight summary per day, range average and neighbouring weigh-ins | `weight-service/weight/range` |
 | `garmin_get_weigh_ins` | Every weigh-in with body composition, or weekly or monthly averages with min and max | `weight-service/weight/all` |
 | `garmin_get_weight_goals` | Weight goals | `goal-service/goal/user/effective/weightgoal` |
 | `garmin_get_fitness_age` | Fitness age and its components | `fitnessage-service/fitnessage/v2` |
+| `garmin_get_vo2_max` | Garmin VO₂ max estimates in a date range, when available | `metrics-service/metrics/maxmet/daily` |
 | `garmin_get_heart_rate_zones` | Heart rate zones configured per sport | `biometric-service/heartRateZones/v2` |
 | **Other** | | |
 | `garmin_get_nutrition` | Logged meals, goals and totals | `nutrition-service/food/logs` |
@@ -252,14 +256,15 @@ Scripts:
    pnpm wrangler login
    ```
 
-2. Create the [Cloudflare Access](#cloudflare-access) application for `/authorize` and put its AUD tag in `.env` as `ACCESS_AUD`, next to `GARMIN_API_KEY`. If you don't know your `workers.dev` subdomain yet, deploy first: until `ACCESS_AUD` matches, `/authorize` answers 403.
-3. Deploy, uploading both secrets at the same time:
+2. Create a placeholder Worker named `garmin-mcp` and your `workers.dev` subdomain in the Cloudflare dashboard. Create the [Cloudflare Access](#cloudflare-access) application for its `/authorize` path.
+3. Enter the Access AUD and Garmin API key at Wrangler's interactive secret prompts (never put their values on the command line):
 
    ```bash
-   pnpm wrangler deploy --secrets-file .env
+   pnpm wrangler secret put ACCESS_AUD
+   pnpm wrangler secret put GARMIN_API_KEY
    ```
 
-4. Wrangler prints the Worker URL: add `/mcp` and [connect a client](#connecting-a-client).
+4. Run `pnpm wrangler deploy`. Wrangler prints the Worker URL: add `/mcp` and [connect a client](#connecting-a-client).
 
 ### Deploying changes
 
@@ -309,12 +314,12 @@ The client opens `/authorize` in your browser: sign in with the code Access emai
   - The form carries a single-use handle bound to the browser and cannot be embedded in another site.
   - Only you reach it: Cloudflare Access signs you in with a one-time code to your email, and the Worker fails closed (403) unless the request carries this Access application's identity (`ctx.access`), so it can't be bypassed through another route.
 - **Secrets:** the Garmin key only lives in the Worker's secrets. MCP clients never see it, and it never appears in logs or responses.
-- **Read-only:** the Personal API cannot write, and the server only sends `GET` requests.
+- **Read-only:** the server sends `GET` requests for Garmin data and uses `POST` only to exchange the Personal API key for an access token.
 - **Personal use:** the Personal API is for the key's owner. This server is meant for a single user and should not be shared with others.
 
 ## Limits
 
-- **What the Personal API doesn't offer:** Training Readiness, VO2 max, race predictions, devices, gear, courses, or uploading workouts. It is read-only and on demand, with no webhooks.
+- **Not exposed by this server:** Training Readiness, race predictions, devices, gear, courses, or workout uploads. VO₂ max is available through `garmin_get_vo2_max` when Garmin returns data. This server is read-only and on demand, with no webhooks.
 - **Rate limits:** Garmin publishes none. The server makes the requests for a range one after another, and `groupBy` scans at most 1,000 activities (10 requests).
 - **CPU:** decoding a long FIT file takes more than the 10 ms of CPU per request of the Workers Free plan. The heaviest FIT file tested in production used 157 ms and worked.
 - **Cost:** a single user's KV and Workers usage fits comfortably in Cloudflare's free tier.

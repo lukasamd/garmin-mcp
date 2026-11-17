@@ -142,10 +142,27 @@ describe("MCP server", () => {
 
   afterEach(() => garmin?.restore());
 
-  it("exposes one read-only tool per Personal API endpoint", async () => {
+  it("exposes read-only Garmin tools", async () => {
     const { tools } = await rpc<{ tools: Array<{ name: string; annotations: Record<string, boolean> }> }>("tools/list");
-    expect(tools).toHaveLength(26);
+    expect(tools).toHaveLength(28);
     expect(tools.every((tool) => tool.name.startsWith("garmin_") && tool.annotations.readOnlyHint)).toBe(true);
+  });
+
+  it("requests VO2 max for the chosen dates and optional sport", async () => {
+    garmin = mockGarmin(() => Response.json([{ calendarDate: "2026-11-01", vo2Max: 50 }]));
+    const result = await callTool("garmin_get_vo2_max", { startDate: "2026-11-01", endDate: "2026-11-10", sport: "running" });
+    const url = garmin.calls.find((call) => call.pathname.includes("/metrics/maxmet/"))!;
+    expect(url.pathname).toBe("/metrics-service/metrics/maxmet/daily/2026-11-01/2026-11-10");
+    expect(url.searchParams.get("sport")).toBe("running");
+    expect(result.isError).not.toBe(true);
+    expect(JSON.parse(result.content.at(-1)!.text)).toEqual([{ calendarDate: "2026-11-01", vo2Max: 50 }]);
+  });
+
+  it("requests Garmin's activity types", async () => {
+    garmin = mockGarmin(() => Response.json([{ typeKey: "running" }]));
+    const result = await callTool("garmin_get_activity_types");
+    expect(garmin.calls.some((url) => url.pathname === "/activity-service/activity/activityTypes/simple")).toBe(true);
+    expect(JSON.parse(result.content.at(-1)!.text)).toEqual([{ typeKey: "running" }]);
   });
 
   it("splits long ranges into Garmin's per-request windows", async () => {

@@ -8,6 +8,7 @@ import { registerBodyTools } from "./tools/body";
 import { registerDailyTools } from "./tools/daily";
 import { registerProfileTools } from "./tools/profile";
 import { registerSleepTools } from "./tools/sleep";
+import { registerPerformanceTools } from "./tools/performance";
 
 export const SERVER_INFO = { name: "garmin-mcp", title: "Garmin Connect", version: "0.1.0" } as const;
 
@@ -22,7 +23,7 @@ Choosing tools:
 - Trends: garmin_get_daily_summaries, garmin_get_sleep_history, garmin_get_hrv_history, garmin_get_steps, garmin_get_stress, garmin_get_body_battery. Long ranges are split into the windows Garmin allows automatically. For months or a year, use period=week or period=month on the daily and sleep summaries and on garmin_get_weigh_ins, and groupBy on garmin_search_activities for distance or time totals; don't add up rows yourself.
 - Training: garmin_search_activities to find activities, garmin_get_activity for the summary and splits, garmin_get_activity_fit for laps and the second-by-second timeline.
 
-Units are metric unless noted: distance in metres, duration in seconds, speed in m/s, weight in kilograms. Timestamps are ISO 8601: fields ending in GMT are UTC; fields ending in Local are wall-clock time in the watch's time zone at that moment, which changes when the user travels. Bulky sample arrays are left out unless a tool's includeSamples/includeReadings/includeRecords option is set. The Personal API is read-only and has no training readiness, VO2 max, race predictions, devices, gear, courses or workout uploads; say so rather than estimating them. Fitness age (garmin_get_fitness_age) is the closest fitness indicator available.`;
+Units are metric unless noted: distance in metres, duration in seconds, speed in m/s, weight in kilograms. Timestamps are ISO 8601: fields ending in GMT are UTC; fields ending in Local are wall-clock time in the watch's time zone at that moment, which changes when the user travels. Bulky sample arrays are left out unless a tool's includeSamples/includeReadings/includeRecords option is set. For VO2 max use garmin_get_vo2_max if Garmin returns data. Training readiness, race predictions, devices, gear, courses and workout uploads are not exposed by this server; do not invent these values.`;
 }
 
 /** Build a fresh server per request (the handler is stateless). */
@@ -39,6 +40,7 @@ export function createServer(env: Env): McpServer {
   registerActivityTools(ctx);
   registerBodyTools(ctx);
   registerProfileTools(ctx);
+  registerPerformanceTools(ctx);
   registerPrompts(ctx.server);
   return ctx.server;
 }
